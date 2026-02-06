@@ -1265,6 +1265,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "playit-agent-ffi"
+version = "0.17.1"
+dependencies = [
+ "playit-agent-core",
+ "playit-api-client",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "playit-agent-proto"
 version = "1.3.0"
 dependencies = [

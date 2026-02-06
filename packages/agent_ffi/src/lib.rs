@@ -10,7 +10,12 @@ use playit_agent_core::network::origin_lookup::OriginLookup;
 use playit_agent_core::network::tcp::tcp_settings::TcpSettings;
 use playit_agent_core::network::udp::udp_settings::UdpSettings;
 use playit_agent_core::playit_agent::{PlayitAgent, PlayitAgentSettings};
+use playit_agent_core::agent_control::version;
 use playit_api_client::PlayitApi;
+use playit_api_client::api::{
+    AssignedAgentCreate, PortType, ReqTunnelsCreate, TunnelOriginCreate, TunnelType,
+};
+use std::net::IpAddr;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{Event, Level, Subscriber};
@@ -24,6 +29,8 @@ struct FfiConfig {
     api_url: Option<String>,
     #[serde(default)]
     poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    agent_version: Option<String>,
 }
 
 #[repr(C)]
@@ -49,6 +56,9 @@ struct LogCallbackState {
     callback: Option<LogCallback>,
     user_data: *mut c_void,
 }
+
+unsafe impl Send for LogCallbackState {}
+unsafe impl Sync for LogCallbackState {}
 
 struct StatusSnapshot {
     code: PlayitStatusCode,
@@ -131,7 +141,8 @@ where
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
 
-        let mut message = visitor.message.unwrap_or_else(|| {
+        let has_message = visitor.message.is_some();
+        let mut message = visitor.message.clone().unwrap_or_else(|| {
             if visitor.fields.is_empty() {
                 event.metadata().target().to_string()
             } else {
@@ -144,7 +155,7 @@ where
             }
         });
 
-        if !visitor.fields.is_empty() && visitor.message.is_some() {
+        if !visitor.fields.is_empty() && has_message {
             let extra = visitor
                 .fields
                 .iter()
@@ -199,7 +210,7 @@ fn send_log(level: Level, message: &str) {
     callback(level_code, c_message.as_ptr(), lock.user_data);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn playit_set_log_callback(callback: Option<LogCallback>, user_data: *mut c_void) {
     ensure_logging();
     let mut lock = log_state().lock().expect("log callback lock poisoned");
@@ -207,14 +218,14 @@ pub extern "C" fn playit_set_log_callback(callback: Option<LogCallback>, user_da
     lock.user_data = user_data;
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn playit_init(config_json: *const c_char) -> i32 {
     ensure_logging();
     if config_json.is_null() {
         return -1;
     }
 
-    let c_str = CStr::from_ptr(config_json);
+    let c_str = unsafe { CStr::from_ptr(config_json) };
     let json = match c_str.to_str() {
         Ok(v) => v,
         Err(_) => return -2,
@@ -237,7 +248,7 @@ pub unsafe extern "C" fn playit_init(config_json: *const c_char) -> i32 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn playit_start() -> i32 {
     ensure_logging();
     let (config, status) = {
@@ -306,7 +317,7 @@ pub extern "C" fn playit_start() -> i32 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn playit_stop() -> i32 {
     let (stop_tx, stopped_rx, keep_running) = {
         let mut lock = state().lock().expect("state lock poisoned");
@@ -337,11 +348,10 @@ pub extern "C" fn playit_stop() -> i32 {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn playit_get_status() -> PlayitStatus {
-    let status = state()
-        .lock()
-        .expect("state lock poisoned")
+    let state_lock = state().lock().expect("state lock poisoned");
+    let status = state_lock
         .status
         .lock()
         .expect("status lock poisoned");
@@ -361,11 +371,25 @@ pub extern "C" fn playit_get_status() -> PlayitStatus {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn playit_get_status_out(out_status: *mut PlayitStatus) {
+    if out_status.is_null() {
+        return;
+    }
+    unsafe {
+        *out_status = playit_get_status();
+    }
+}
+
 async fn run_agent(
     config: FfiConfig,
     status: Arc<Mutex<StatusSnapshot>>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    if let Some(ver) = config.agent_version.as_deref() {
+        version::help_register_version(ver, "308943e8-faef-4835-a2ba-270351f72aa3");
+    }
+
     let api_url = config
         .api_url
         .unwrap_or_else(|| "https://api.playit.gg".to_string());
@@ -378,6 +402,14 @@ async fn run_agent(
         .v1_agents_rundata()
         .await
         .map_err(|e| format!("failed to load run data: {}", e))?;
+
+    if initial_data.tunnels.is_empty() && initial_data.pending.is_empty() {
+        if let Err(error) = ensure_default_tunnel(&api, &initial_data).await {
+            tracing::error!(?error, "failed to create default tunnel");
+        } else {
+            tracing::info!("created default tunnel");
+        }
+    }
     lookup.update_from_run_data(&initial_data).await;
 
     update_status_from_rundata(&status, &initial_data);
@@ -428,6 +460,32 @@ async fn run_agent(
     }
 
     Ok(())
+}
+
+async fn ensure_default_tunnel(
+    api: &PlayitApi,
+    data: &playit_api_client::api::AgentRunDataV1,
+) -> Result<(), String> {
+    let req = ReqTunnelsCreate {
+        name: Some("JESSI".to_string()),
+        tunnel_type: Some(TunnelType::MinecraftJava),
+        port_type: PortType::Tcp,
+        port_count: 1,
+        origin: TunnelOriginCreate::Agent(AssignedAgentCreate {
+            agent_id: data.agent_id,
+            local_ip: IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            local_port: Some(25565),
+        }),
+        enabled: true,
+        alloc: None,
+        firewall_id: None,
+        proxy_protocol: None,
+    };
+
+    api.tunnels_create(req)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("tunnel create failed: {}", e))
 }
 
 fn update_status_from_rundata(

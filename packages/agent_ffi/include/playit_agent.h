@@ -23,10 +23,9 @@ typedef struct {
 
 typedef void (*playit_log_callback)(int32_t level, const char *message, void *user_data);
 
-// Log levels: -1=TRACE, 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR
+// -1=TRACE, 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR
 void playit_set_log_callback(playit_log_callback callback, void *user_data);
 
-// Config JSON fields:
 // - secret_key (string, required)
 // - api_url (string, optional; default https://api.playit.gg)
 // - poll_interval_ms (number, optional; default 3000)
@@ -35,10 +34,10 @@ int32_t playit_init(const char *config_json);
 int32_t playit_start(void);
 int32_t playit_stop(void);
 playit_status playit_get_status(void);
+void playit_get_status_out(playit_status *out_status);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
